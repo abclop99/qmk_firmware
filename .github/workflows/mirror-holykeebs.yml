@@ -1,0 +1,102 @@
+name: Mirror holykeebs/hk-master
+
+# Keeps origin/hk-master in sync with the holykeebs/qmk_firmware vendor fork's
+# hk-master branch, transferring only the new commits each run.
+#
+# Strategy (optimised for fast-forwards -- the normal case):
+#   1. Shallow-fetch THIS repo's current hk-master tip (depth 1) as a baseline.
+#      origin/hk-master is a SHA-identical mirror of holykeebs, so this tip is a
+#      real commit in holykeebs's history.
+#   2. Fetch hk-master from holykeebs: because we already hold that baseline tip,
+#      git negotiates and downloads only the commits added on top (the repo
+#      stays shallow at the baseline).
+#   3. Decide by ANCESTRY, never by parsing push output: identical tips means
+#      nothing new; if the baseline is an ancestor of what holykeebs now has,
+#      it's a fast-forward, so a plain (non-force) push extends origin's history
+#      without rewriting it. Otherwise holykeebs rewrote hk-master: re-fetch the
+#      FULL history -- a shallow force-push would leave origin's ref broken --
+#      then force-push. This is the rare slow path and the ONLY force-push.
+#
+# IMPORTANT:
+#   * Scheduled workflows only run from the repo's DEFAULT branch (`dev`); this
+#     file must exist there for the cron to fire. `master` is never touched.
+#   * origin/hk-master is overwritten from upstream every run -- treat it as a
+#     disposable, read-only mirror; never commit your own work onto it.
+#   * GitHub disables scheduled workflows after ~60 days of repo inactivity and
+#     emails the owner; use the manual "Run workflow" button to re-trigger.
+
+on:
+  schedule:
+    - cron: '17 7 * * *'   # daily ~07:17 UTC; dial down to weekly if preferred
+  workflow_dispatch:        # adds a manual "Run workflow" button
+
+permissions:
+  contents: write           # only scope needed: push a branch to this repo
+
+concurrency:
+  group: mirror-hk-master
+  cancel-in-progress: true  # a new sync supersedes an in-flight one; the push
+                            # is atomic per ref, so an interrupted run just re-runs
+
+jobs:
+  mirror:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30      # generous ceiling; the rare full re-fetch path
+                             # re-downloads upstream history (the step-3 force path)
+    steps:
+      - name: Sync holykeebs/hk-master -> origin/hk-master
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          # Auth header for pushing to origin. The base64 blob is NOT the raw
+          # token, so Actions' auto-masking does not cover it -- register it
+          # explicitly so it can never surface in logs. Do NOT add `set -x`: a
+          # command trace would print this header.
+          blob="$(printf 'x-access-token:%s' "$GH_TOKEN" | base64 | tr -d '\n')"
+          echo "::add-mask::$blob"
+          auth="Authorization: Basic $blob"
+
+          origin="https://github.com/${GITHUB_REPOSITORY}.git"
+          holykeebs="https://github.com/holykeebs/qmk_firmware.git"
+
+          git init -q mirror
+          cd mirror
+
+          # 1. Baseline: our current hk-master tip (shallow), kept as
+          #    refs/heads/base so step 2 negotiates against it and step 3 can
+          #    test fast-forward-ness. If origin/hk-master is missing this fetch
+          #    fails and the job aborts -- intended: the mirror branch is
+          #    expected to exist, so its disappearance deserves a loud failure
+          #    rather than a silent re-create.
+          git -c http.extraheader="$auth" fetch --no-tags --depth=1 "$origin" hk-master:refs/heads/base
+
+          # 2. Incremental fetch of holykeebs's commits into an explicit local
+          #    ref. Naming the ref -- instead of relying on the implicit
+          #    FETCH_HEAD -- keeps the push source below unambiguous.
+          git fetch --no-tags "$holykeebs" hk-master:refs/heads/upstream
+
+          # 3. Publish. Short-circuit the no-change case first, then decide
+          #    force-vs-plain STRUCTURALLY by ancestry rather than by parsing
+          #    git's (version-dependent) push output.
+          if [ "$(git rev-parse refs/heads/base)" = "$(git rev-parse refs/heads/upstream)" ]; then
+            # Identical tips => holykeebs added nothing since the last run.
+            echo "Already up to date; holykeebs/hk-master has no new commits."
+          elif git merge-base --is-ancestor refs/heads/base refs/heads/upstream; then
+            # Baseline is an ancestor of upstream => ordinary fast-forward. A
+            # plain push extends origin's history and never rewrites it. The
+            # shallow client can push this because origin already has the
+            # baseline the new commits build on.
+            git -c http.extraheader="$auth" push "$origin" refs/heads/upstream:refs/heads/hk-master
+            echo "Mirror fast-forwarded ($(git rev-list --count refs/heads/base..refs/heads/upstream) new commit(s))."
+          else
+            # Baseline is NOT an ancestor => holykeebs rewrote hk-master
+            # (rebase/force-push). Deepen our shallow upstream ref to its FULL
+            # history -- a shallow force-push would leave origin's ref
+            # unconnected -- then force-overwrite the mirror.
+            echo "::warning::No fast-forward; holykeebs rewrote hk-master. Fetching full history and force-pushing."
+            git fetch --no-tags --unshallow "$holykeebs" hk-master:refs/heads/upstream
+            git -c http.extraheader="$auth" push --force "$origin" refs/heads/upstream:refs/heads/hk-master
+            echo "Mirror force-synced (full history)."
+          fi
